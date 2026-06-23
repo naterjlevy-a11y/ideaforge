@@ -1,9 +1,10 @@
 # IdeaForge — Technical Requirements Document
 
 **Working Title:** IdeaForge  
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Draft  
 **Date:** 2026-06-22  
+**Last Reviewed:** 2026-06-22 (post research-agent audit)  
 **Author:** Claude Code (on behalf of naterjlevy)
 
 ---
@@ -288,16 +289,27 @@ If an AI agent could run autonomously — asking clarifying questions, building 
 | Deployment | Vercel | Free Hobby tier, Next.js native, cron support |
 | File Storage | Supabase Storage | For PDF exports (V2) |
 
-### 6.3 Why Vercel Cron Over pg_cron
+### 6.3 Background Scheduling: cron-job.org (Not Vercel Cron)
 
-Supabase pg_cron is only available on the Pro plan ($25/month). Vercel Cron Jobs are free on the Hobby plan and call a Next.js API route on a schedule. This API route queries Supabase for ideas that have a scheduled expansion due and fires the expansion Edge Function. This is zero-cost and achieves the same result.
+Supabase pg_cron is only available on the Pro plan ($25/month). Rather than Vercel Cron, the chosen scheduler is **cron-job.org** — a free external cron service that fires HTTP requests to your API route on any schedule, including every 30 minutes.
 
-**Tradeoff:** Vercel Hobby plan limits cron frequency to daily. For 30-minute expansions, we use the Vercel Hobby cron to call a self-scheduling mechanism:
-- Idea is submitted → creates a record with `next_expansion_at = now() + 30 minutes`
-- Cron runs every hour, finds all ideas where `next_expansion_at <= now()` and fires them
-- Expansion completes → updates `next_expansion_at = now() + interval`
+**Why not Vercel Cron:** Vercel Hobby plan is hard-capped at **once per day** — an hourly or 30-minute cron expression will fail to deploy. Vercel Pro ($20/month) unlocks sub-daily frequency but is unnecessary when cron-job.org is free.
 
-**Alternative if more frequent scheduling is needed:** Upstash QStash (free tier: 500 messages/day, supports scheduled HTTP calls). At max 3 concurrent ideas with 30-minute intervals = 144 calls/day — within free limit.
+**cron-job.org setup:**
+- Create a free account at cron-job.org
+- Add a cron job: `POST https://your-app.vercel.app/api/cron/expand` every 30 minutes
+- Add `Authorization: Bearer {CRON_SECRET}` header for security
+- Enable email failure alerts (built-in, free)
+- Zero code changes to `/api/cron/expand` — same endpoint, different trigger source
+
+**How custom durations work:**
+- User sets "3.5 hours" → `expires_at = now() + 3.5h`, `next_expansion_at = now()`
+- cron-job.org fires every 30 minutes → API checks `next_expansion_at <= now()` and `expires_at > now()`
+- Expansion runs → sets `next_expansion_at = now() + 30min`
+- At expiry → marks idea `completed`, stops scheduling further runs
+- The user's chosen duration is fully respected, with 30-minute iteration precision
+
+**Alternative if cron-job.org is unavailable:** Upstash QStash (free tier: 1,000 messages/day). At max 3 concurrent ideas × 48 runs/day = 144 calls/day — well within the free limit.
 
 ### 6.4 Data Flow: Idea Submission to First Expansion
 
@@ -715,11 +727,19 @@ type RealtimeEvent =
 
 ### 9.1 Model Configuration
 
-**Default (free):** `deepseek/deepseek-r1:free` via OpenRouter  
-**Fallback:** `meta-llama/llama-3.3-70b-instruct:free`  
-**Paid option:** `anthropic/claude-3.5-sonnet`
+**Primary (free):** Google Gemini 2.5 Flash via Google AI Studio API  
+**Fallback:** `deepseek/deepseek-r1:free` via OpenRouter  
+**Second fallback:** `meta-llama/llama-3.3-70b-instruct:free` via OpenRouter  
+**Paid option:** `anthropic/claude-sonnet-4-6` via Anthropic API
 
-**Why DeepSeek R1:** Strong reasoning, free on OpenRouter, handles structured output well. The main limitation is rate limits (RPM) and potential availability issues — hence the fallback.
+**Why Gemini 2.5 Flash as primary:**
+- 1,500 free requests/day via Google AI Studio — the highest free daily limit of any major provider
+- 1,000,000 tokens per minute throughput — no queueing
+- No credit card required for the free tier
+- Reasoning quality comparable to DeepSeek R1 for structured output tasks
+- API is stable and well-documented
+
+**OpenRouter cold-start warning:** A fresh OpenRouter API key with no purchase history is limited to **50 requests/day** (not 1,000). At ~10 API calls per expansion iteration, that's only 5 full expansion runs before hitting the wall. If using OpenRouter as the primary AI, spend $10 once to permanently unlock 1,000 req/day on all free models. This is a one-time cost. Alternatively, using Google AI Studio as the primary (above) avoids this entirely.
 
 **Important caveat:** Free models on OpenRouter have shared rate limits and may queue. The expansion loop must handle 429 responses gracefully (retry with exponential backoff, fall back to secondary model).
 
@@ -873,27 +893,26 @@ const channel = supabase
   .subscribe();
 ```
 
-### 10.2 Vercel Cron Configuration
+### 10.2 Cron Configuration (cron-job.org)
 
-```json
-// vercel.json
-{
-  "crons": [
-    {
-      "path": "/api/cron/expand",
-      "schedule": "0 * * * *"
-    }
-  ]
-}
+No `vercel.json` cron block is used. Scheduling is handled externally by **cron-job.org**.
+
+**cron-job.org job settings:**
+```
+URL:       POST https://your-app.vercel.app/api/cron/expand
+Schedule:  Every 30 minutes  (*/30 * * * *)
+Header:    Authorization: Bearer {CRON_SECRET}
+Timeout:   30 seconds
+On failure: Email alert to developer
 ```
 
 The `/api/cron/expand` route:
-1. Verifies `Authorization: Bearer {CRON_SECRET}` header
+1. Verifies `Authorization: Bearer {CRON_SECRET}` header (returns 401 if missing/wrong)
 2. Queries: `SELECT id FROM ideas WHERE status = 'running' AND next_expansion_at <= NOW() AND deleted_at IS NULL`
 3. For each idea, calls the `expand-idea` Edge Function (non-blocking, fire-and-forget)
 4. Returns 200 with count of expansions triggered
 
-**Gap Analysis:** Vercel Hobby cron is hourly at most. For 30-minute interval ideas, the cron runs hourly — meaning an idea might wait up to 60 minutes between iterations instead of 30. This is acceptable for V1. To get true 30-minute intervals, upgrade to Vercel Pro ($20/month) or use Upstash QStash.
+**Note:** The first expansion runs immediately when the idea is created (the `/api/ideas` POST route calls `expand-idea` directly), so users see output within 60–90 seconds of submitting. Subsequent iterations are managed by the 30-minute cron.
 
 **For immediate first expansion:** When an idea is created, the `/api/ideas` POST route directly calls the `expand-idea` Edge Function synchronously (or with a 5-second timeout and then async). This means the user sees output within 60-90 seconds of submitting.
 
@@ -1132,14 +1151,17 @@ Environment variables required:
 
 ### 15.4 Scale Ceiling (Free Tier)
 
-Supabase Free: 500MB DB, 2GB bandwidth, 50k Edge Function invocations/month
-Vercel Hobby: 100GB bandwidth, 12 edge function executions/day (for API routes used by cron)
+Supabase Free: 500MB DB, 2GB bandwidth, **500k Edge Function invocations/month**, 200 peak Realtime connections
+Vercel Hobby: 100GB bandwidth, serverless functions included
 
 At 10 active users, each running 2 ideas at 30-min intervals:
-- 10 × 2 × 48 runs/day = 960 edge function calls/day → well within limits
+- 10 × 2 × 48 runs/day = 960 edge function calls/day → 28,800/month → well within 500k limit
 - DB growth: ~50KB per idea fully expanded → 500 ideas = 25MB → fine
 
-**Scale trigger to upgrade Supabase Pro:** > 200 active users or > 100MB DB
+At 100 active users × 3 concurrent ideas × 48 runs/day = 14,400/day = 432,000/month → still within 500k
+At ~350 active users the 500k limit is reached.
+
+**Scale trigger to upgrade Supabase Pro ($25/month):** > 350 active users, or DB > 400MB, or needing pg_cron for tighter scheduling control
 
 ---
 
@@ -1270,15 +1292,18 @@ supabase functions serve # run edge functions locally
 
 ## 19. Cost Analysis
 
-### 19.1 Free Tier Projection (0–50 users)
+### 19.1 Free Tier Projection (0–350 users)
 
 | Service | Free Tier | Expected Usage | Cost |
 |---|---|---|---|
-| Vercel Hobby | 100GB bandwidth, cron support | Minimal traffic | $0 |
-| Supabase Free | 500MB DB, 50k Edge Fn calls | 10k calls/month | $0 |
-| OpenRouter (DeepSeek R1:free) | Free model | All expansion calls | $0 |
-| Upstash QStash | 500 msg/day free | Scheduling backup | $0 |
+| Vercel Hobby | 100GB bandwidth | Minimal traffic | $0 |
+| Supabase Free | 500MB DB, **500k** Edge Fn calls/month | ~30k calls/month at 50 users | $0 |
+| Google AI Studio (Gemini 2.5 Flash) | 1,500 req/day free | All expansion calls | $0 |
+| cron-job.org | Unlimited jobs, any schedule | 1 job firing every 30 min | $0 |
+| Upstash QStash (fallback) | **1,000** msg/day free | Scheduling backup only | $0 |
 | **Total** | | | **$0/month** |
+
+> Note: If OpenRouter is used instead of Google AI Studio, spend $10 once to unlock 1,000 req/day on free models. This is a one-time cost, not recurring.
 
 ### 19.2 Growth Tier (50–500 users)
 
@@ -1373,11 +1398,11 @@ These are checks run against this TRD itself to verify its soundness:
 ### Technical Feasibility: ✅ PASS
 All technologies listed (Next.js 14, Supabase, OpenRouter, Vercel, Mermaid.js) are production-ready, well-documented, and have sufficient free tiers for V1. The architecture is standard and commonly deployed.
 
-### Free Tier Sustainability: ✅ PASS (with caveat)
-The app can run for free up to ~50 active users. The main risk is Supabase Edge Function cold starts and the 50k/month invocation limit. At 30-minute intervals with 50 users × 3 ideas = 150 concurrent ideas × 48 runs/day = 7,200 calls/day = 216,000/month. **This exceeds the 50k free limit at scale.** Resolution: upgrade to Supabase Pro at this point (~$25/month), or cap concurrent running ideas more aggressively.
+### Free Tier Sustainability: ✅ PASS
+The app runs free up to ~350 active users. Supabase free tier is 500k Edge Function invocations/month (not 50k as previously documented). At 50 users × 3 ideas × 48 runs/day = 216,000/month — comfortably within limits. Scale trigger to Supabase Pro is ~350 active users, not 50.
 
-### Cron Frequency Gap: ⚠️ ACCEPTABLE RISK
-Vercel Hobby cron is hourly. This means expansion intervals are 60 minutes at best, not 30. Users set "3h" expecting ~6 iterations, but get ~3. **Mitigation:** The first expansion runs immediately (not via cron), so the user sees output within 2 minutes. The subsequent iterations being hourly is a V1 tradeoff, documented in the UI.
+### Cron Frequency: ✅ RESOLVED
+cron-job.org provides true 30-minute scheduling for free — the Vercel Hobby cron limitation (daily max) is bypassed entirely. Users who set "3.5 hours" get 7 expansion iterations at 30-minute intervals, exactly as expected. No frequency gap in V1.
 
 ### OpenRouter Free Model Reliability: ⚠️ KNOWN RISK
 Free models on OpenRouter are rate-limited and may be unavailable. The fallback model chain (R1 → Llama 3.3 → error) mitigates this but doesn't eliminate it. **Mitigation:** Graceful retry, clear user communication if expansion fails.
